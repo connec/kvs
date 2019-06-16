@@ -1,10 +1,15 @@
 #[macro_use]
 extern crate clap;
 
-use clap::{Arg, SubCommand};
+use clap::{AppSettings, Arg, SubCommand};
+use std::env;
+use std::process;
 
-fn main() {
-    app_from_crate!()
+use kvs::{Error, KvStore, Result};
+
+fn run() -> Result<()> {
+    let matches = app_from_crate!()
+        .setting(AppSettings::ArgRequiredElseHelp)
         .subcommand(
             SubCommand::with_name("get")
                 .about("Get the value of a given key")
@@ -23,5 +28,56 @@ fn main() {
         )
         .get_matches();
 
-    panic!("unimplemented")
+    match matches.subcommand() {
+        ("get", Some(args)) => {
+            let key = args
+                .value_of("key")
+                .expect("Missing value for required arg: key");
+
+            let mut kvs = KvStore::open(env::current_dir()?)?;
+            match kvs.get(key.to_owned())? {
+                Some(value) => println!("{}", value),
+                None => println!("Key not found"),
+            };
+
+            Ok(())
+        }
+        ("set", Some(args)) => {
+            let key = args
+                .value_of("key")
+                .expect("Missing value for required arg: key");
+            let value = args
+                .value_of("value")
+                .expect("Missing value for required arg: value");
+
+            let mut kvs = KvStore::open(env::current_dir()?)?;
+            kvs.set(key.to_owned(), value.to_owned())?;
+
+            Ok(())
+        }
+        ("rm", Some(args)) => {
+            let key = args
+                .value_of("key")
+                .expect("Missing value for required arg: key");
+
+            let mut kvs = KvStore::open(env::current_dir()?)?;
+            kvs.remove(key.to_owned()).or_else(|err| match err {
+                Error::NotFound(_) => {
+                    println!("Key not found");
+                    process::exit(1)
+                }
+                err => Err(err),
+            })?;
+
+            Ok(())
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("Error: {}", err);
+        process::exit(1);
+    }
 }
