@@ -9,7 +9,8 @@ use kvs::{Error, KvStore, Result};
 
 fn run() -> Result<()> {
     let matches = app_from_crate!()
-        .setting(AppSettings::ArgRequiredElseHelp)
+        .setting(AppSettings::SubcommandRequiredElseHelp)
+        .setting(AppSettings::VersionlessSubcommands)
         .subcommand(
             SubCommand::with_name("get")
                 .about("Get the value of a given key")
@@ -39,8 +40,6 @@ fn run() -> Result<()> {
                 Some(value) => println!("{}", value),
                 None => println!("Key not found"),
             };
-
-            Ok(())
         }
         ("set", Some(args)) => {
             let key = args
@@ -52,8 +51,6 @@ fn run() -> Result<()> {
 
             let mut kvs = KvStore::open(env::current_dir()?)?;
             kvs.set(key.to_owned(), value.to_owned())?;
-
-            Ok(())
         }
         ("rm", Some(args)) => {
             let key = args
@@ -62,17 +59,17 @@ fn run() -> Result<()> {
 
             let mut kvs = KvStore::open(env::current_dir()?)?;
             kvs.remove(key.to_owned()).or_else(|err| match err {
-                Error::NotFound(_) => {
-                    println!("Key not found");
-                    process::exit(1)
+                Error::KeyNotFound => {
+                    println!("{}", err);
+                    process::exit(1);
                 }
                 err => Err(err),
             })?;
-
-            Ok(())
         }
         _ => unreachable!(),
     }
+
+    Ok(())
 }
 
 fn main() {
