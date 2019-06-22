@@ -4,37 +4,31 @@
 
 #![deny(missing_docs)]
 
-use rmp_serde::decode::{Error::InvalidMarkerRead, ReadReader};
-use rmp_serde::encode::StructArrayWriter;
-use rmp_serde::{Deserializer, Serializer};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom};
 use std::mem;
 use std::path::{Path, PathBuf};
-use tempfile::tempfile;
 
-/// The offset of the value in a serialized Command.
-///
-/// This is an (probably premature) optimisation for reading values from the log. By serializing the
-/// `value` of [`Command::Set`] first we know where the value will be relative to the offset of the
-/// serialized `Command`. Enum variants are serialized as a fixed array with two values - an integer
-/// representing the variant's index and the serialized contents of the variant. The contents are
-/// serialized as fixed arrays based on the number of contained values. This means the value for
-/// `Command::Set` is serialized after:
-/// - The `fixarray` format marker for the whole variant.
-/// - The `positive fixint` format marker for the variant's index.
-/// - The `fixarray` format marker for the number of fields in the variant.
-const VALUE_OFFSET: u64 = 3;
+mod command;
+mod error;
+mod log;
+
+use command::Command;
+pub use error::{Error, Result};
+use log::{Offset, Reader, Writer};
 
 /// The offset at which to try compacting.
 ///
 /// Note: This drives a pretty broken compaction implementation where we rewrite a single log file
 /// to remove duplicate commands.
-const COMPACTION_OFFSET: u64 = 1000000;
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 /// A simple log-based key value store.
+///
+/// The log is persisted to disk as files in a given directory. These files will be named for a
+/// monotonically increasing 'log index' with a `.log` extension. The contents of the files should
+/// be considered opaque (currently they contain a sequence of [MessagePack]-encoded 'commands', the
+/// details of which are private to the crate).
 ///
 /// ```
 /// # use std::path::PathBuf;
@@ -54,68 +48,19 @@ const COMPACTION_OFFSET: u64 = 1000000;
 /// ```
 pub struct KvStore {
     path: PathBuf,
-    writer: Serializer<File, StructArrayWriter>,
-    reader: Deserializer<ReadReader<File>>,
-    index: HashMap<String, u64>,
+    log_index: u64,
+    writer: Writer,
+    readers: HashMap<u64, Reader>,
+    index: HashMap<String, IndexEntry>,
+    uncompacted: u64,
 }
 
-/// An enum representing the errors that can occur when interacting with a KvStore.
+/// An entry in a command index.
 #[derive(Debug)]
-pub enum Error {
-    /// Wraps IO errors that occur when trying to read or write log files.
-    Io(std::io::Error),
-
-    /// Wraps decoding errors that occur when trying to read log files.
-    Decode(rmp_serde::decode::Error),
-
-    /// Wraps encoding errors that occur when trying to write to log files.
-    Encode(rmp_serde::encode::Error),
-
-    /// Indicates that a key could not be found.
-    NotFound(String),
-}
-
-impl std::error::Error for Error {}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Error::Io(err) => write!(f, "Database IO error: {}", err),
-            Error::Decode(err) => write!(f, "Command decode error: {}", err),
-            Error::Encode(err) => write!(f, "Command encode error: {}", err),
-            Error::NotFound(key) => write!(f, "Key not found: {}", key),
-        }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Error {
-        Error::Io(err)
-    }
-}
-
-impl From<rmp_serde::decode::Error> for Error {
-    fn from(err: rmp_serde::decode::Error) -> Error {
-        Error::Decode(err)
-    }
-}
-
-impl From<rmp_serde::encode::Error> for Error {
-    fn from(err: rmp_serde::encode::Error) -> Error {
-        Error::Encode(err)
-    }
-}
-
-/// A convenience `Result` alias that pins the error to our own.
-pub type Result<V> = std::result::Result<V, Error>;
-
-/// An enum representing the available KvStore commands.
-#[derive(Debug, Deserialize, Serialize)]
-enum Command {
-    // The field ordering is very important here. We rely on serializing the value first so we know
-    // what offset to read it back from.
-    Set { value: String, key: String },
-    Remove { key: String },
+struct IndexEntry {
+    log_index: u64,
+    offset: Offset,
+    length: u64,
 }
 
 impl KvStore {
@@ -130,32 +75,37 @@ impl KvStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = if path.as_ref().is_dir() {
-            path.as_ref().join("1")
-        } else {
-            path.as_ref().to_path_buf()
-        };
+    pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self> {
+        let path = path.into();
+        fs::create_dir_all(&path)?;
 
-        let mut writer = Serializer::new(OpenOptions::new().create(true).write(true).open(&path)?);
-        writer.get_mut().seek(SeekFrom::End(0))?;
+        let mut uncompacted = 0;
+        let mut index: HashMap<String, IndexEntry> = HashMap::new();
+        let mut readers = HashMap::new();
 
-        let mut reader = Deserializer::new(OpenOptions::new().read(true).open(&path)?);
-        let mut index = HashMap::new();
-        let mut offset = 0;
-        while let Some(command) = KvStore::replay_command(&mut reader)? {
-            match command {
-                Command::Set { key, value: _ } => index.insert(key, offset + VALUE_OFFSET),
-                Command::Remove { key } => index.remove(&key),
-            };
-            offset = reader.get_mut().seek(SeekFrom::Current(0))?;
+        let log_indices = find_log_indices(&path)?;
+
+        for &log_index in &log_indices {
+            let mut reader = open_reader(&path, log_index)?;
+            for entry in reader.load()? {
+                uncompacted += open_entry(log_index, &mut index, entry?);
+            }
+            readers.insert(log_index, reader);
+        }
+
+        let write_index = *log_indices.last().unwrap_or(&0);
+        let writer = open_writer(&path, write_index)?;
+        if readers.is_empty() {
+            readers.insert(write_index, open_reader(&path, write_index)?);
         }
 
         Ok(KvStore {
             path,
+            log_index: write_index,
             writer,
-            reader,
+            readers,
             index,
+            uncompacted,
         })
     }
 
@@ -172,13 +122,13 @@ impl KvStore {
     /// # }
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let offset = match self.index.get(&key) {
-            Some(offset) => *offset,
+        let entry = match self.index.get(&key) {
+            Some(entry) => entry,
             None => return Ok(None),
         };
 
-        self.reader.get_mut().seek(SeekFrom::Start(offset))?;
-        Ok(Some(Deserialize::deserialize(&mut self.reader)?))
+        let reader = self.readers.get_mut(&entry.log_index).expect("Missing reader");
+        Ok(Some(reader.read_value(&entry.offset)?))
     }
 
     /// Set a key to a value in a store.
@@ -198,14 +148,20 @@ impl KvStore {
             key: key.clone(),
             value: value.clone(),
         };
-        let mut offset = self.writer.get_mut().seek(SeekFrom::Current(0))?;
 
-        if offset > COMPACTION_OFFSET {
-            offset = self.compact()?;
+        let (offset, length) = self.writer.write(&command)?;
+        let new_entry = IndexEntry {
+            log_index: self.log_index,
+            offset,
+            length,
+        };
+        if let Some(old_entry) = self.index.insert(key, new_entry) {
+            self.uncompacted += old_entry.length;
         }
 
-        command.serialize(&mut self.writer)?;
-        self.index.insert(key, offset + VALUE_OFFSET);
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
 
         Ok(())
     }
@@ -224,54 +180,116 @@ impl KvStore {
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
         if !self.index.contains_key(&key) {
-            return Err(Error::NotFound(key));
+            return Err(Error::KeyNotFound);
         }
 
         let command = Command::Remove { key: key.clone() };
-        command.serialize(&mut self.writer)?;
-        self.index.remove(&key);
+        self.writer.write(&command)?;
+        let old_entry = self.index.remove(&key).expect("Key not found after check");
+        self.uncompacted += old_entry.length;
         Ok(())
     }
 
-    fn replay_command(
-        deserializer: &mut Deserializer<ReadReader<File>>,
-    ) -> Result<Option<Command>> {
-        Deserialize::deserialize(deserializer)
-            .map(Some)
-            .or_else(|err| match err {
-                InvalidMarkerRead(_) => Ok(None),
-                err => Err(err.into()),
-            })
-    }
-
-    /// Perform an extremely dumb log compaction operation.
+    /// Compact the log directory to a single file.
     ///
-    /// This will truncate the log file and refill it with a minimal set of commands.
-    fn compact(&mut self) -> Result<u64> {
-        let mut rewriter = Serializer::new(tempfile()?);
-        let mut new_offset = 0;
-        for (key, offset) in self.index.iter_mut() {
-            self.reader.get_mut().seek(SeekFrom::Start(*offset))?;
-            let value = Deserialize::deserialize(&mut self.reader)?;
-            Command::Set {
-                key: key.to_owned(),
-                value,
-            }
-            .serialize(&mut rewriter)?;
-            *offset = new_offset + VALUE_OFFSET;
-            new_offset = rewriter.get_mut().seek(SeekFrom::Current(0))?;
+    /// This will dump the keys and values currently in the index into a new log file and advance
+    /// the current log index/writer to another new log file. It also resets the `uncompacted` count
+    /// as the log will be minimal once `compact` completes.
+    fn compact(&mut self) -> Result<()> {
+        // Set up a file for the compacted log.
+        let compaction_index = self.log_index + 1;
+        let mut compaction_writer = open_writer(&self.path, compaction_index)?;
+        self.readers.insert(compaction_index, open_reader(&self.path, compaction_index)?);
+
+        // Set up a file for future commands.
+        let write_index = compaction_index + 1;
+        let writer = open_writer(&self.path, write_index)?;
+        self.log_index = write_index;
+        self.writer = writer;
+        self.readers.insert(self.log_index, open_reader(&self.path, write_index)?);
+
+        // Go through the index and write out a `Command::Set` for each value. The resulting log
+        // file will be free from `Remove` commands or duplicate `Set`s for the same key, making it
+        // minimal.
+        for (key, entry) in self.index.iter_mut() {
+            let reader = self.readers.get_mut(&entry.log_index).expect("Missing reader");
+            let value = reader.read_value(&entry.offset)?;
+            let command = Command::Set { key: key.to_owned(), value };
+            let (offset, length) = compaction_writer.write(&command)?;
+
+            // Update the index in-place with the new details.
+            *entry = IndexEntry {
+                log_index: compaction_index,
+                offset,
+                length
+            };
         }
-        rewriter.get_mut().seek(SeekFrom::Start(0))?;
 
-        fs::remove_file(&self.path)?;
-        let mut new_writer = Serializer::new(File::create(&self.path)?);
-        io::copy(rewriter.get_mut(), new_writer.get_mut())?;
+        // Delete the log files that are now redundant.
+        let old_log_indices: Vec<_> = self
+            .readers
+            .keys()
+            .filter(|&&log_index| log_index < compaction_index)
+            .cloned()
+            .collect();
+        for old_index in old_log_indices {
+            fs::remove_file(log_path(&self.path, old_index))?;
+            self.readers.remove(&old_index);
+        }
 
-        let new_reader = Deserializer::new(File::open(&self.path)?);
+        // Reset the number of uncompacted bytes (if we don't do this `compact` will be called on
+        // every subsequent call to `set` - not good).
+        self.uncompacted = 0;
 
-        mem::replace(&mut self.writer, new_writer);
-        mem::replace(&mut self.reader, new_reader);
-
-        Ok(new_offset)
+        Ok(())
     }
+}
+
+fn open_writer<P: AsRef<Path>>(path: P, log_index: u64) -> Result<Writer> {
+    Writer::init(OpenOptions::new().create(true).write(true).open(log_path(path, log_index))?)
+}
+
+fn open_reader<P: AsRef<Path>>(path: P, log_index: u64) -> Result<Reader> {
+    Ok(Reader::new(File::open(log_path(path, log_index))?))
+}
+
+fn find_log_indices<P: AsRef<Path>>(path: P) -> Result<Vec<u64>> {
+    let mut log_indices: Vec<_> = fs::read_dir(&path)?
+        .flat_map(|entry| -> Result<_> { Ok(entry?.path()) })
+        .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
+        .flat_map(|path| path.file_stem().and_then(|s| s.to_str()).map(str::parse))
+        .flatten()
+        .collect();
+    log_indices.sort_unstable();
+    Ok(log_indices)
+}
+
+fn open_entry(
+    log_index: u64,
+    index: &mut HashMap<String, IndexEntry>,
+    (command, offset, length): (Command, Offset, u64),
+) -> u64 {
+    match command {
+        Command::Set { key, .. } => {
+            let new_entry = IndexEntry {
+                log_index,
+                offset,
+                length,
+            };
+            if let Some(old_entry) = index.get_mut(&key) {
+                mem::replace(old_entry, new_entry);
+                old_entry.length
+            } else {
+                index.insert(key, new_entry);
+                0
+            }
+        },
+        Command::Remove { key } => {
+            length + index.remove(&key).map(|e| e.length).unwrap_or(0)
+        }
+    }
+}
+
+fn log_path<P: AsRef<Path>>(dir: P, index: u64) -> PathBuf {
+    dir.as_ref().join(format!("{}.log", index))
 }
