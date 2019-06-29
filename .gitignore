@@ -1,2 +1,6 @@
 /target
 **/*.rs.bk
+.engine
+conf
+db
+snap.0000000000000380
