@@ -6,12 +6,12 @@ use rand::seq::IteratorRandom;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-use kvs::{Engine, Sled, Store};
+use kvs::{KvsEngine, KvStore, SledKvStore};
 
 fn bench_kvs(c: &mut Criterion) {
     c.bench_function("kvs_write", |b| {
         let temp_dir = TempDir::new().unwrap();
-        let mut engine = Store::open(temp_dir.path()).unwrap();
+        let mut engine = KvStore::open(temp_dir.path()).unwrap();
         let mut rng = StdRng::seed_from_u64(0);
 
         b.iter_batched(
@@ -23,7 +23,7 @@ fn bench_kvs(c: &mut Criterion) {
 
     c.bench_function("kvs_read", |b| {
         let temp_dir = TempDir::new().unwrap();
-        let mut engine = Store::open(temp_dir.path()).unwrap();
+        let mut engine = KvStore::open(temp_dir.path()).unwrap();
         let mut rng = StdRng::seed_from_u64(0);
         let data = gen_data(&mut rng, &mut engine);
 
@@ -42,7 +42,7 @@ fn bench_kvs(c: &mut Criterion) {
 fn bench_sled(c: &mut Criterion) {
     c.bench_function("sled_write", |b| {
         let temp_dir = TempDir::new().unwrap();
-        let mut engine = Sled::open(temp_dir.path()).unwrap();
+        let mut engine = SledKvStore::start_default(temp_dir.path()).unwrap();
         let mut rng = StdRng::seed_from_u64(0);
 
         b.iter_batched(
@@ -54,7 +54,7 @@ fn bench_sled(c: &mut Criterion) {
 
     c.bench_function("sled_read", |b| {
         let temp_dir = TempDir::new().unwrap();
-        let mut engine = Sled::open(temp_dir.path()).unwrap();
+        let mut engine = SledKvStore::start_default(temp_dir.path()).unwrap();
         let mut rng = StdRng::seed_from_u64(0);
         let data = gen_data(&mut rng, &mut engine);
 
@@ -70,7 +70,7 @@ fn bench_sled(c: &mut Criterion) {
     });
 }
 
-fn gen_data(mut rng: impl Rng, engine: &mut impl Engine) -> HashMap<String, String> {
+fn gen_data(mut rng: impl Rng, engine: &mut impl KvsEngine) -> HashMap<String, String> {
     let mut data = HashMap::with_capacity(1000);
     for _ in 0..1000 {
         let (key, value) = gen_kv(&mut rng);

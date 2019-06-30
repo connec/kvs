@@ -1,14 +1,13 @@
+mod log;
+
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use crate::command::Command;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
-use crate::log::{Offset, Reader, Writer};
-
-const ENGINE_ID: &[u8] = b"kvs";
+use self::log::{Command, Offset, Reader, Writer};
 
 /// The offset at which to try compacting.
 ///
@@ -71,8 +70,6 @@ impl Store {
     pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
-
-        check_engine(&path)?;
 
         let mut uncompacted = 0;
         let mut index: HashMap<String, IndexEntry> = HashMap::new();
@@ -240,26 +237,6 @@ impl Engine for Store {
         self.uncompacted += old_entry.length;
         Ok(())
     }
-}
-
-fn check_engine<P: AsRef<Path>>(path: P) -> Result<()> {
-    use std::io::{Read, Write};
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(path.as_ref().join(".engine"))?;
-    let mut contents = vec![];
-    file.read_to_end(&mut contents)?;
-    if contents.is_empty() {
-        file.write(&ENGINE_ID)?;
-        return Ok(())
-    }
-    if contents != ENGINE_ID {
-        return Err(Error::WrongEngine);
-    }
-    Ok(())
 }
 
 fn open_writer<P: AsRef<Path>>(path: P, log_index: u64) -> Result<Writer> {

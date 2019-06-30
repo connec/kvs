@@ -1,9 +1,9 @@
 use rmp_serde::decode::{Error::InvalidMarkerRead, from_read as read_mp};
 use rmp_serde::encode::write as write_mp;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 
-use crate::command::Command;
 use crate::error::Result;
 
 /// The offset of the value in a serialized Command.
@@ -18,6 +18,21 @@ use crate::error::Result;
 /// - The `positive fixint` format marker for the variant's index.
 /// - The `fixarray` format marker for the number of fields in the variant.
 const VALUE_OFFSET: u64 = 3;
+
+/// An enum representing the available KvStore commands.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum Command {
+    /// Set a given `key` to a given `value`.
+    ///
+    /// **Note:** the field ordering is important here as it ensures the value is serialized before
+    /// the key. This allows [`Reader`] to read values from disk without having to first read keys
+    /// (e.g. when the location is known from an index).
+    Set { value: String, key: String },
+
+    /// Remove a given `key`.
+    Remove { key: String },
+}
+
 
 /// A marker struct indicating that the contained value is a valid log offset.
 #[derive(Debug)]

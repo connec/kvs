@@ -2,13 +2,9 @@
 extern crate clap;
 
 use clap::{AppSettings, Arg, SubCommand};
-use rmp_serde::decode::from_read as read_mp;
-use rmp_serde::encode::write as write_mp;
 use std::process;
-use std::net::TcpStream;
 
-use kvs::{DEFAULT_ADDRESS, Result};
-use kvs::{Request, Response};
+use kvs::{DEFAULT_ADDRESS, Client, Result};
 
 fn run() -> Result<()> {
     let matches = app_from_crate!()
@@ -42,19 +38,10 @@ fn run() -> Result<()> {
                 .expect("Missing value for required arg: key");
             let address = args.value_of("address").unwrap_or(DEFAULT_ADDRESS);
 
-            let mut stream = TcpStream::connect(address)?;
-            let request = Request::Get { key: key.to_owned() };
-            write_mp(&mut stream, &request)?;
-            let response = read_mp(&stream)?;
-            drop(stream);
-
-            match response {
-                Response::Found { value } => println!("{}", value),
-                Response::NotFound => println!("Key not found"),
-                _ => {
-                    eprintln!("Protocol error: server replied {:?} to {:?}", response, request);
-                    process::exit(2);
-                }
+            let mut client = Client::connect(address)?;
+            match client.get(key.to_owned())? {
+                Some(value) => println!("{}", value),
+                None => println!("Key not found"),
             }
         }
         ("set", Some(args)) => {
@@ -66,23 +53,8 @@ fn run() -> Result<()> {
                 .expect("Missing value for required arg: value");
             let address = args.value_of("address").unwrap_or(DEFAULT_ADDRESS);
 
-            let mut stream = TcpStream::connect(address)?;
-            let request = Request::Set { key: key.to_owned(), value: value.to_owned() };
-            write_mp(&mut stream, &request)?;
-            let response = read_mp(&stream)?;
-            drop(stream);
-
-            match response {
-                Response::Ok => {},
-                Response::NotFound => {
-                    eprintln!("Key not found");
-                    process::exit(1);
-                },
-                _ => {
-                    eprintln!("Protocol error: server replied {:?} to {:?}", response, request);
-                    process::exit(2);
-                }
-            }
+            let mut client = Client::connect(address)?;
+            client.set(key.to_owned(), value.to_owned())?;
         }
         ("rm", Some(args)) => {
             let key = args
@@ -90,23 +62,8 @@ fn run() -> Result<()> {
                 .expect("Missing value for required arg: key");
             let address = args.value_of("address").unwrap_or(DEFAULT_ADDRESS);
 
-            let mut stream = TcpStream::connect(address)?;
-            let request = Request::Remove { key: key.to_owned() };
-            write_mp(&mut stream, &request)?;
-            let response = read_mp(&stream)?;
-            drop(stream);
-
-            match response {
-                Response::Ok => {},
-                Response::NotFound => {
-                    eprintln!("Key not found");
-                    process::exit(1);
-                },
-                _ => {
-                    eprintln!("Protocol error: server replied {:?} to {:?}", response, request);
-                    process::exit(2);
-                }
-            }
+            let mut client = Client::connect(address)?;
+            client.remove(key.to_owned())?;
         }
         _ => unreachable!(),
     }

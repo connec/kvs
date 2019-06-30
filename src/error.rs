@@ -1,3 +1,5 @@
+use crate::protocol::{Request, Response};
+
 /// An enum representing the errors that can occur when interacting with a KvStore.
 #[derive(Debug)]
 pub enum Error {
@@ -20,6 +22,9 @@ pub enum Error {
 
     /// Indicates that a DB was loaded with the wrong engine.
     WrongEngine,
+
+    /// Indicates that a server replied with the wrong thing.
+    ProtocolError(Request, Response),
 }
 
 impl std::error::Error for Error {
@@ -43,6 +48,14 @@ impl std::fmt::Display for Error {
             Error::Sled(err) => write!(f, "Sled error: {}", err),
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::WrongEngine => write!(f, "Wrong engine"),
+            Error::ProtocolError(request, response) => {
+                write!(
+                    f,
+                    "Protocol error: received response {:?} which is invalid for request {:?}",
+                    request,
+                    response
+                )
+            },
         }
     }
 }

@@ -1,4 +1,10 @@
+mod kvs;
+mod sled;
+
 use crate::error::Result;
+
+pub use self::kvs::Store as KvStore;
+pub use self::sled::Db as SledKvStore;
 
 /// Defines the storage interface used from [`server::Server`].
 ///

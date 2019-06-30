@@ -6,9 +6,12 @@ extern crate slog;
 use clap::Arg;
 use slog::Drain;
 use std::env;
+use std::fs;
+use std::io::ErrorKind::NotFound;
+use std::path::PathBuf;
 use std::process;
 
-use kvs::{DEFAULT_ADDRESS, KvsEngine, Result, Server, Sled, Store};
+use kvs::{DEFAULT_ADDRESS, Error, KvsEngine, KvStore, Result, Server, SledKvStore};
 
 const VALID_ENGINES: &[&'static str] = &["kvs", "sled"];
 const DEFAULT_ENGINE: &'static str = "kvs";
@@ -35,6 +38,8 @@ fn run() -> Result<()> {
     let path = env::current_dir()?;
     let address = matches.value_of("address").unwrap_or(DEFAULT_ADDRESS);
 
+    check_engine(&path, engine)?;
+
     info!(root, "Starting engine";
         "version" => crate_version!(),
         "engine" => engine,
@@ -42,18 +47,31 @@ fn run() -> Result<()> {
 
     match engine {
         "kvs" => {
-            let mut server = make_server(root, Store::open(path)?, address)?;
+            let mut server = make_server(root, address, KvStore::open(path)?)?;
             server.run()
         },
         "sled" => {
-            let mut server = make_server(root, Sled::open(path)?, address)?;
+            let mut server = make_server(root, address, SledKvStore::start_default(path)?)?;
             server.run()
         },
         _ => panic!("Invalid engine: {}", engine),
     }
 }
 
-fn make_server<E: KvsEngine>(root: slog::Logger, engine: E, address: &str) -> Result<Server<E>> {
+fn check_engine(path: &PathBuf, engine: &str) -> Result<()> {
+    let path = path.join("engine");
+    match fs::read_to_string(&path) {
+        Ok(ref contents) if contents == engine  => Ok(()),
+        Ok(_) => Err(Error::WrongEngine),
+        Err(ref err) if err.kind() == NotFound => {
+            fs::write(&path, engine)?;
+            Ok(())
+        },
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn make_server<E: KvsEngine>(root: slog::Logger, address: &str, engine: E) -> Result<Server<E>> {
     Server::start(
         root.new(o!("address" => address.to_string())),
         engine,

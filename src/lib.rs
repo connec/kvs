@@ -4,21 +4,17 @@
 
 #![deny(missing_docs)]
 
-mod command;
+mod client;
 mod engine;
 mod error;
-mod log;
 mod protocol;
 mod server;
-mod sled;
-mod store;
 
-pub use crate::sled::Sled;
-pub use engine::{Engine, Engine as KvsEngine};
+pub use client::Client;
+pub use engine::{Engine as KvsEngine, KvStore, SledKvStore};
 pub use error::{Error, Result};
 pub use protocol::{Request, Response};
 pub use server::Server;
-pub use store::{Store, Store as KvStore};
 
 /// The default address for a KVS server.
 pub const DEFAULT_ADDRESS: &'static str = "127.0.0.1:4001";
